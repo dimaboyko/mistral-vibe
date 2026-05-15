@@ -39,6 +39,13 @@ Version covered: `2.9.6` (per `pyproject.toml` and `distribution/zed/extension.t
 27. [Event Catalog & Data Models](#27-event-catalog--data-models)
 28. [Reproduction Notes for Reimplementers](#28-reproduction-notes-for-reimplementers)
 
+**Appendices**
+- [A. Built-in Tool Schemas (Exact)](#appendix-a--built-in-tool-schemas-exact)
+- [B. LLM Wire Format & Tool-Call Assembly](#appendix-b--llm-wire-format--tool-call-assembly)
+- [C. TUI Subsystems Reference](#appendix-c--tui-subsystems-reference)
+- [D. Auxiliary Subsystems & Exact Wire / Text Content](#appendix-d--auxiliary-subsystems--exact-wire--text-content)
+- [E. Errata & Confirmations Against §1–§28](#appendix-e--errata--confirmations-against-1-28)
+
 ---
 
 ## 1. Product Overview
@@ -441,15 +448,23 @@ The set of found `config_dirs`, `tools`, `skills`, `agents` is exposed via `Conf
 
 **Purpose.** Refuse to load user-supplied code or config from a workspace until the user has opted in.
 
-**File format** (`~/.vibe/trusted_folders.toml`):
+**File format** (`~/.vibe/trusted_folders.toml`) — TOML with two top-level **arrays of absolute path strings**:
 
 ```toml
-[trusted]
-"/home/user/project1" = ""
-
-[untrusted]
-"/home/user/sketchy" = ""
+trusted = [
+  "/home/user/project1",
+  "/home/user/project2",
+]
+untrusted = [
+  "/home/user/sketchy",
+]
 ```
+
+Created and updated by `TrustedFoldersManager` in `vibe/core/trusted_folders.py`. Empty file is bootstrapped on first read if missing or malformed.
+
+**Trustable file detection** (`find_trustable_files(path)`): returns the set of *relative* paths that, if present in `path`, would cause Vibe to read user-supplied configuration. Triggers the trust prompt when the directory is undecided. The detector reports:
+- `AGENTS.md` (file in `path`).
+- Any directory returned by `walk_local_config_dirs(path).config_dirs` — i.e. a found `.vibe/` (containing config / prompts / tools / skills / agents) or `.agents/` (containing `skills/`).
 
 **Resolution algorithm** (`core/trusted_folders.py`):
 1. Resolve the path to absolute form.
@@ -1682,4 +1697,633 @@ These pieces are tightly coupled to Mistral infrastructure and may be replaced w
 
 ---
 
-*End of specification.*
+---
+
+# Appendices — Deep-Dive Reference
+
+The following appendices give wire-level / line-level detail for areas that the body of the spec describes structurally. They are intended to remove every remaining ambiguity for a reimplementer. Where a numeric default or string literal is given, it is normative; a port is non-conformant if it diverges silently.
+
+## Appendix A — Built-in Tool Schemas (Exact)
+
+Each subsection gives the canonical Pydantic schema, defaults, errors, and prompt-file summary for one built-in tool. All tools live in `vibe/core/tools/builtins/`. Tool prompt files (`vibe/core/tools/builtins/prompts/<name>.md`) are sent to the LLM as the tool description body.
+
+### A.1 `read_file`
+
+- **LLM description (`ClassVar`).** "Read a text file (encoding detected safely), returning content from a specific line range. Reading is capped by a byte limit for safety."
+- **Args (`ReadFileArgs`).** `path: str`, `offset: int = 0` (0-indexed inclusive line), `limit: int | None = None`.
+- **Result (`ReadFileResult`).** `path: str`, `content: str`, `offset: int`, `lines_read: int`, `was_truncated: bool`.
+- **Config (`ReadFileToolConfig`).** `permission = ALWAYS`, `sensitive_patterns = ["**/.env", "**/.env.*"]`, `max_read_bytes = 64_000`.
+- **State.** `injected_agents_md: set[str]` — tracks which `AGENTS.md` files have been injected via `get_result_extra()` to avoid duplicates.
+- **Prompt summary.** Use `offset`/`limit` for large files; avoid 3+ calls on the same file; never read model checkpoints or binary files.
+- **Errors (verbatim).** `"Path cannot be empty"`, `"Offset cannot be negative"`, `"Limit, if provided, must be a positive number"`, `"Security error: Cannot read path '...' outside of the project directory"`, `"File not found at: ..."`, `"Path is a directory, not a file: ..."`, `"Error reading {file_path}: {exc}"`.
+- **Permission resolution.** `resolve_file_tool_permission(path, allowlist, denylist, sensitive_patterns)` — the same helper used by `write_file`, `search_replace`, and `grep`. Sensitive patterns force `ASK` even when default is `ALWAYS`.
+- **Side effect.** On success, may inject `AGENTS.md` content found in subdirectories of `path` via `get_result_extra()` wrapped in warning tags (one-shot per file path per session).
+- **Display.** `format_call_display`: `Reading {path}` (with `(from line X, limit Y)` and `(scratchpad)` suffixes when applicable). `get_result_display`: `Read N line(s) from {filename}` (`(truncated)` suffix on truncation). `get_status_text`: `Reading file`.
+
+### A.2 `write_file`
+
+- **LLM description.** "Create or overwrite a UTF-8 file. Fails if file exists unless 'overwrite=True'."
+- **Args.** `path: str`, `content: str`, `overwrite: bool = False`.
+- **Result.** `path: str`, `bytes_written: int`, `file_existed: bool`, `content: str`.
+- **Config.** `permission = ASK`, `sensitive_patterns = ["**/.env", "**/.env.*"]`, `max_write_bytes = 64_000`, `create_parent_dirs = True`.
+- **Errors.** `"Path cannot be empty"`, `"Content exceeds {max_write_bytes} bytes limit"`, `"File '{path}' exists. Set overwrite=True to replace."`, `"Parent directory does not exist: {parent}"`, `"Error writing {file_path}: {e}"`.
+- **Snapshot.** Calls `get_file_snapshot_for_path()` so the rewind feature can restore overwritten content.
+- **Display.** `Writing {path}` (with `(overwrite)` and `(scratchpad)` flags); result `Created` / `Overwritten {filename}`.
+
+### A.3 `search_replace`
+
+- **LLM description.** Tells the model to send one or more SEARCH/REPLACE blocks:
+
+  ```
+  <<<<<<< SEARCH
+  [text to find — exact whitespace]
+  =======
+  [replacement text]
+  >>>>>>> REPLACE
+  ```
+
+  Five or more `=` characters are required between SEARCH and REPLACE. The body is parsed by two regexes (`SEARCH_REPLACE_BLOCK_RE` and `SEARCH_REPLACE_BLOCK_WITH_FENCE_RE`), so blocks may appear inside or outside ` ``` ` fences.
+- **Args.** `file_path: str`, `content: str` (one or more blocks).
+- **Result.** `file: str`, `blocks_applied: int`, `lines_changed: int`, `content: str` (echo), `warnings: list[str]`.
+- **Config.** `permission = ASK`, `sensitive_patterns = same as write`, `max_content_size = 100_000`, `create_backup = False`, `fuzzy_threshold = 0.9`.
+- **Match semantics.** Literal exact text match (whitespace included). Only the first occurrence is replaced per block — multiple matches produce a warning. On miss, the tool runs a `difflib.SequenceMatcher` window over the file and surfaces the closest match (≥ `fuzzy_threshold`) plus a unified diff truncated to 2000 chars in the error message.
+- **Errors.** `"File path cannot be empty"`, `"Content size ({size} bytes) exceeds max_content_size ({max} bytes)"`, `"Empty content provided"`, `"File does not exist: {path}"`, `"Path is not a file: {path}"`, `"No valid SEARCH/REPLACE blocks found..."`, `"SEARCH/REPLACE blocks failed:\n{errors}"`, `"Permission denied reading file: {path}"`, `"OS error reading/writing..."`.
+
+### A.4 `bash`
+
+- **LLM description.** "Run a one-off bash command and capture its output."
+- **Args.** `command: str`, `timeout: int | None`.
+- **Result.** `command: str`, `stdout: str` (truncated), `stderr: str` (truncated), `returncode: int`.
+- **Config.** `permission = ASK`, `max_output_bytes = 16_000`, `default_timeout = 300`, `allowlist`/`denylist`/`denylist_standalone` (defaults below), `sensitive_patterns = ["sudo"]`.
+- **Default allowlist** (Unix): `cd, echo, git diff, git log, git status, tree, whoami, cat, file, find, head, ls, pwd, stat, tail, uname, wc, which`. Windows: `cd, echo, git diff, git log, git status, tree, whoami, dir, findstr, more, type, ver, where`.
+- **Default denylist** (Unix): `gdb, pdb, passwd, nano, vim, vi, emacs, bash -i, sh -i, zsh -i, fish -i, dash -i, screen, tmux`. Windows adds `cmd /k, powershell -NoExit, pwsh -NoExit, notepad`.
+- **`denylist_standalone`** (Unix): `python, python3, ipython, bash, sh, nohup, vi, vim, emacs, nano, su` — denied only when invoked with no arguments.
+- **Composite-command parsing.** `_extract_commands` walks the tree-sitter-bash AST collecting nodes of type `command`. Each child node of type `command_name | word | string | raw_string | concatenation` is concatenated to form the sub-command string. Pipes, `&&`, `||`, semicolons, and subshells produce multiple sub-commands.
+- **Permission flow** (`resolve_permission`):
+  1. Windows ⇒ return `None` (no analysis).
+  2. `_resolve_guardrail_permission`: per-sub-command — denylist match ⇒ `NEVER` with reason; standalone-denylist ⇒ `NEVER`; `find … -exec/-execdir/-ok/-okdir` ⇒ adds a `COMMAND_PATTERN` `RequiredPermission`.
+  3. `_collect_outside_dirs`: for sub-commands whose first token is in `_PATH_COMMANDS` (`cat, cd, chmod, chown, cp, head, ls, mkdir, mv, rm, stat, tail, touch, wc`), inspect each path-like argument (starts with `/`, `~`, `.`, or contains `/`). If it resolves outside the workdir and is not inside a scratchpad ⇒ collect parent dir.
+  4. `_is_unconditionally_allowed`: returns False if any sub-command matches `sensitive_patterns`; returns False if config permission ≠ `ALWAYS`; otherwise True iff every sub-command is allowlisted AND `outside_dirs` is empty.
+  5. `_build_required_permissions`: builds `COMMAND_PATTERN` requirements for sensitive and non-allowlisted sub-commands (via `build_session_pattern`) and `OUTSIDE_DIRECTORY` requirements (`{dir}/*` glob) for collected outside dirs.
+- **Subprocess.** `asyncio.create_subprocess_shell(stdin=DEVNULL, env=_get_base_env(), executable=os.environ.get("SHELL"), start_new_session=True (Unix))`. Output decoded with platform-specific encoding (UTF-8 Unix; `cp{OEMCP}` Windows).
+- **Errors.** `"Command timed out after {timeout}s: {command!r}"`, `"Command failed: {command!r}\nReturn code: {returncode}\nStderr: …\nStdout: …"`, `"Error running command {command!r}: {exc}"`.
+
+### A.5 `grep`
+
+- **LLM description.** "Recursively search files for a regex pattern using ripgrep (rg) or grep. Respects .gitignore and .codeignore files by default when using ripgrep."
+- **Args.** `pattern: str`, `path: str = "."`, `max_matches: int | None`, `use_default_ignore: bool = True`.
+- **Result.** `matches: str` (newline-joined `path:line:content`), `match_count: int`, `was_truncated: bool`. Property `parsed_matches: list[GrepMatch]` parses the string back (handles Windows drive letters such as `C:\repo\file.py:10:…`).
+- **Config.** `permission = ALWAYS`, `sensitive_patterns = ["**/.env", "**/.env.*"]`, `max_output_bytes = 64_000`, `default_max_matches = 100`, `default_timeout = 60`, `exclude_patterns` (long curated list), `codeignore_file = ".vibeignore"`.
+- **Backend selection.** `shutil.which("rg")` ⇒ ripgrep; else `shutil.which("grep")` ⇒ GNU grep; else `ToolError`.
+- **Ripgrep cmdline.** `rg --line-number --no-heading --smart-case --no-binary --max-count {max+1} [--no-ignore] [--glob !pattern] -e {pattern} {path}`.
+- **GNU grep cmdline.** `grep -r -n -I -E --max-count={max+1} [-i] [--exclude-dir=…] [--exclude=…] -e {pattern} {path}`.
+
+### A.6 `task`
+
+- **LLM description.** "Delegate a task to a subagent for independent execution. Useful for exploration, research, or parallel work that doesn't require user interaction. The subagent runs in-memory and saves interaction logs."
+- **Args.** `task: str`, `agent: str = "explore"`.
+- **Result.** `response: str`, `turns_used: int`, `completed: bool`.
+- **Config.** `permission = ASK`, `allowlist = ["explore"]` (only `explore` is auto-approved by default).
+- **Permission resolution.** `args.agent` matched against denylist (`fnmatch`) ⇒ `NEVER`; against allowlist ⇒ `ALWAYS`; else `None`.
+- **Errors.** `"Task tool requires agent_manager in context"`, `"Unknown agent: {name}"`, `"Agent '{name}' is a {type} agent. Only subagents can be used..."`.
+- **Subagent invocation.** Creates a new `AgentLoop(is_subagent=True)`, injects scratchpad info if available, streams `AssistantEvent` and `ToolResultEvent`, marks `completed = False` if any event is `stopped_by_middleware` or `skipped`. Each subagent tool result is forwarded as a `ToolStreamEvent` so the parent sees progress.
+
+### A.7 `todo`
+
+- **LLM description.** "Manage todos. Use action='read' to view, action='write' with complete list to update."
+- **Args.** `action: "read" | "write"`, `todos: list[TodoItem] | None`.
+- **TodoItem.** `id: str`, `content: str`, `status: PENDING | IN_PROGRESS | COMPLETED | CANCELLED`, `priority: LOW | MEDIUM | HIGH`.
+- **Result.** `message: str`, `todos: list[TodoItem]`, `total_count: int`.
+- **Config.** `permission = ALWAYS`, `max_todos = 100`.
+- **State.** In-memory list (per session, not persisted to disk).
+- **Errors.** `"Cannot store more than {max_todos} todos"`, `"Todo IDs must be unique"`.
+
+### A.8 `ask_user_question`
+
+- **LLM description.** "Ask the user one or more questions and wait for their responses. Each question has 2-4 choices plus an automatic 'Other' option for free text."
+- **Args (`AskUserQuestionArgs`).** `questions: list[Question]` (1–4), `content_preview: str | None`.
+- **Question.** `question: str`, `header: str` (≤ 12 chars), `options: list[Choice]` (2–4), `multi_select: bool = False`, `hide_other: bool = False`.
+- **Choice.** `label: str`, `description: str = ""`.
+- **Answer.** `question: str`, `answer: str`, `is_other: bool = False`.
+- **Errors.** `"User input not available. This tool requires an interactive UI."` (when `user_input_callback` missing — i.e. programmatic mode).
+
+### A.9 `exit_plan_mode`
+
+- **LLM description.** "Signal that your plan is complete and you are ready to start implementing. This will ask the user to confirm switching from plan mode to accept-edits mode."
+- **Args.** Empty.
+- **Result.** `switched: bool`, `message: str`.
+- **Permission.** `ALWAYS`.
+- **Behaviour.** Reads the plan file via `ctx.plan_file_path` (when set) and shows it as `content_preview` to the user. Internally calls `user_input_callback` with three options: *Yes, auto-approve edits* (switches to `accept-edits`), *Yes, require approval* (switches to `default`), *No* (stays in `plan`). Switch is performed via `ctx.switch_agent_callback(name)` if available, otherwise `agent_manager.switch_profile(name)`.
+- **Errors.** `"ExitPlanMode requires an agent manager context."`, `"ExitPlanMode can only be used in plan mode."`, `"ExitPlanMode requires an interactive UI."`, `"Failed to read plan file at {path}: {e}"`.
+
+### A.10 `webfetch`
+
+- **LLM description.** "Fetch content from a URL. Converts HTML to markdown for readability."
+- **Args.** `url: str`, `timeout: int | None` (capped at `max_timeout`).
+- **Result.** `url: str`, `content: str`, `content_type: str`, `was_truncated: bool`.
+- **Config.** `permission = ASK`, `default_timeout = 30`, `max_timeout = 120`, `max_content_bytes = 120_000`, `user_agent =` modern Chrome UA (with bot-detection fallback to `vibe-cli`).
+- **URL normalisation.** Protocol-relative `//example.com` and bare `example.com` get an `https://` prefix.
+- **Permission resolution.** When the static permission is `ASK`, returns a `URL_PATTERN` `RequiredPermission` for the host domain.
+- **HTML→Markdown.** Custom `markdownify.MarkdownConverter` removes `script/style/noscript/iframe/object/embed`.
+- **Bot-detection retry.** On 403 with `cf-mitigated: challenge`, retry once with the honest `vibe-cli` User-Agent.
+
+### A.11 `websearch`
+
+- **LLM description.** "Search the web for current information using Mistral's web search."
+- **Args.** `query: str` (min length 1).
+- **Result.** `answer: str`, `sources: list[{title, url}]` (deduped by URL).
+- **Config.** `permission = ASK`, `timeout = 120`, `model = "mistral-vibe-cli-with-tools"`.
+- **Availability.** Tool only registered if `MISTRAL_API_KEY` is in env.
+- **Backend.** `client.beta.conversations.start_async()` with the `web_search` tool — extracts `TextChunk` (answer) and `ToolReferenceChunk` (sources).
+
+### A.12 `skill`
+
+- **LLM description.** "Load a specialized skill that provides domain-specific instructions and workflows. … The skill will inject detailed instructions, workflows, and access to bundled resources (scripts, references, templates) into the conversation context."
+- **Args.** `name: str`.
+- **Result.** `name: str`, `content: str` (XML-wrapped), `skill_dir: str | None`.
+- **Permission.** `ALWAYS`.
+- **Behaviour.** `skill_manager.get_skill(name)` lookup; collect up to 10 bundled files via `skill_dir.rglob("*")` (skipping `SKILL.md`); wrap in `<skill_content name="…">` and `<skill_files>` sections (relative paths from skill base dir).
+- **Errors.** `"Skill manager not available"`, `'Skill "{name}" not found. Available skills: {comma_separated}'`.
+
+---
+
+## Appendix B — LLM Wire Format & Tool-Call Assembly
+
+### B.1 `APIToolFormatHandler` (`vibe/core/llm/format.py`)
+
+- `process_api_response_message(provider_msg)` ⇒ canonical `LLMMessage`. Tool calls are translated to `ToolCall(id, index, type, function={name, arguments: str})`. Reasoning fields are propagated when the provider emits them.
+- `parse_message(LLMMessage)` ⇒ list of `ParsedToolCall(tool_name, raw_args: dict, call_id)`. JSON-decodes each `function.arguments`; **on `JSONDecodeError`, defaults to `{}` silently** so a malformed stream still surfaces a recoverable failure downstream.
+- `resolve_tool_calls(parsed, tool_manager)` ⇒ list of `ResolvedToolCall | FailedToolCall`.
+  - Unknown tool ⇒ `FailedToolCall(error="Unknown tool '{name}'")`.
+  - Pydantic `ValidationError` ⇒ `FailedToolCall(error=f"Invalid arguments: {e}")` (full error detail included).
+- `create_tool_response_message(call, result_text)` ⇒ `LLMMessage(role=tool, tool_call_id, name, content)`.
+
+### B.2 `LLMMessage.__add__` accumulation rules
+
+Strict invariants — violation raises `ValueError`:
+- Different `role` ⇒ `"Can't accumulate messages with different roles"`.
+- Different `name` ⇒ `"Can't accumulate messages with different names"`.
+- Different `tool_call_id` ⇒ `"Can't accumulate messages with different tool_call_ids"`.
+
+Tool-call merge:
+- `tool_calls` are merged in an `OrderedDict` keyed by `index`; missing index ⇒ `"Tool call chunk missing index"`.
+- New chunk extends an existing tool-call by **string-concatenating `function.arguments`** (i.e. partial JSON pieces are appended in order).
+- Conflicting non-empty `function.name` between chunks ⇒ `"Can't accumulate messages with different tool call names"`. New name is accepted if old was empty.
+
+Validation is deferred until the *complete* message has accumulated; the parser always runs against the joined argument string.
+
+### B.3 Mistral backend (`vibe/core/llm/backend/mistral.py`)
+
+- Message conversion: `MistralMapper.prepare_message`:
+  - `system` ⇒ `SystemMessage(content=msg.content or "")`.
+  - `user` ⇒ `UserMessage(content=msg.content)`.
+  - `assistant` with `reasoning_content` ⇒ content list `[ThinkChunk(thinking=[TextChunk(reasoning_content)]), TextChunk(content?)]`. Without reasoning, content is plain string.
+  - `tool` ⇒ `ToolMessage(content, tool_call_id, name)`.
+- Tool conversion: `Tool(type="function", function=Function(name, description, parameters))`.
+- Retry config: exponential backoff, 500 ms initial, 30 s max, exponent 1.5, max elapsed 300 s, retries on connection errors.
+- SSL: `build_ssl_context()` (cached LRU 1) — starts from `certifi.where()`, additively loads `SSL_CERT_FILE` / `SSL_CERT_DIR`, logs and continues on error.
+- Streaming: extracts `mistral-correlation-id` response header, yields `LLMChunk(message, usage, correlation_id)` per delta.
+- `count_tokens()`: implemented by calling `complete(max_tokens=1)` and reading `usage.prompt_tokens`. **No dedicated count-tokens endpoint.**
+- Error mapping: `BackendErrorBuilder.build_http_error()` (SDKError) and `build_request_error()` (httpx.RequestError) wrap into `BackendError` with provider, endpoint, status, headers, body, model, payload summary (msg count, char count, model, temperature, tools enabled).
+
+### B.4 Generic backend (`vibe/core/llm/backend/generic.py`) and adapters
+
+`APIAdapter` protocol:
+```python
+endpoint: ClassVar[str]
+def prepare_request(...) -> PreparedRequest
+def parse_response(data, provider) -> LLMChunk
+```
+
+OpenAI-compatible adapter:
+- Tool format: `{type: "function", function: {name, description, parameters}}`.
+- `excludes` `message_id`, `reasoning_message_id`, `reasoning_state`, `injected` from outgoing message JSON.
+- Reasoning field name remapped via `provider.reasoning_field_name`.
+- Streaming payload includes `stream: true`, `stream_options: {include_usage: true, stream_tool_calls: true}` (Mistral-specific extension).
+- SSE parsing: lines starting with `data:`, terminated by `[DONE]` sentinel; comment lines (`:…`) and blank lines skipped.
+
+Anthropic adapter:
+- Tool format: `{name, description, input_schema}`.
+- System message extracted as a separate top-level string.
+- User content = `[{type: "text", text: "…"}]`; tool results appended to last user message or create one.
+- Streaming events: `message_start`, `content_block_start` (initialises tool call with id+name), `input_json_delta` (appends partial JSON to args), `content_block_delta`, `message_delta`, `message_stop`. Thinking blocks have type `thinking` with nested text blocks.
+
+Vertex adapter:
+- Inherits all conversion from the Anthropic adapter.
+- Endpoint: `/v1/projects/{project_id}/locations/{region}/publishers/anthropic/models/{model}:{rawPredict|streamRawPredict}`.
+- Base URL: `https://{region}-aiplatform.googleapis.com` (or `…/aiplatform.googleapis.com` for global).
+- Auth: Google ADC. `VertexCredentials.access_token` calls `google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])`, refreshes when stale (thread-safe via lock), sends `Authorization: Bearer {access_token}`.
+
+### B.5 Reasoning adapter (`reasoning_adapter.py`)
+
+Not a true wrapper — it is a full adapter. `_parse_content_blocks(content)`:
+- string ⇒ `(content, None)`
+- list of blocks ⇒ concatenate `text` blocks into content; concatenate inner text blocks of `thinking` blocks into `reasoning_content`.
+
+### B.6 Backend exceptions (`vibe/core/llm/exceptions.py`)
+
+`BackendError(RuntimeError)` carries `provider`, `endpoint`, `status`, `reason`, `headers` (lowercased keys), `body_text`, `parsed_error`, `model`, `payload_summary`.
+
+`is_context_too_long`:
+- Only `True` when `status == 400` AND the (lowercased) body contains any of:
+  - `"context too long"`
+  - `"maximum context length"`
+  - `"input too large"`
+  - `"couldn't fit with truncation"`
+  - `"prompt is too long"`
+
+User-facing formatting:
+- `401` ⇒ `"Invalid API key. Please check your API key and try again."`
+- `429` ⇒ `"Rate limit exceeded. Please wait a moment before trying again."`
+- otherwise: multi-line block including status, reason, request id, endpoint, model, provider message, body excerpt (400 chars max with `…` overflow), payload summary JSON.
+
+The agent loop maps:
+- `status == 429` ⇒ `RateLimitError(provider, model)` (re-raised; no internal retry).
+- `is_context_too_long` ⇒ `ContextTooLongError(provider, model)`.
+- non-retryable Temporal errors ⇒ re-raised verbatim.
+- everything else ⇒ `RuntimeError(f"API error from {provider}…")`.
+
+---
+
+## Appendix C — TUI Subsystems Reference
+
+### C.1 CLI cache (`vibe/cli/cache.py`)
+
+TOML file with sections (e.g. `[updates]`, `[whats_new]`).
+- `read_cache(path)` ⇒ `dict` (empty on `OSError`/`TOMLDecodeError`).
+- `write_cache(path, section, data)` ⇒ merges `data` into `existing[section]`, creates parent dirs, silent no-op on `OSError`. Default location: `$VIBE_HOME/cache.toml`.
+
+### C.2 Profiler (`vibe/cli/profiler.py`)
+
+- Activation: `VIBE_PROFILE=1`.
+- API: `profiler.start("startup")` then `profiler.stop_and_print()`.
+- Output: `{label}-profile.html` and `{label}-profile.txt` in cwd; coloured text summary to stderr.
+- No-op when env var unset or `pyinstrument` not installed.
+
+### C.3 Stderr guard (`vibe/cli/stderr_guard.py`)
+
+A context manager that, on Unix TTYs:
+1. `dup`s fd 2 to a new fd pointing at the real terminal.
+2. `dup2`s `/dev/null` over fd 2 (absorbs stray native writes).
+3. Reassigns `sys.__stderr__` and `sys.stderr` to a Python file object wrapping the dup'd fd, so Textual continues rendering correctly.
+4. Restores everything on exit.
+
+No-op on Windows or when fd 2 is not a TTY.
+
+### C.4 Terminal detect (`vibe/cli/terminal_detect.py`)
+
+`detect_terminal()` returns a `Terminal` enum value. Detection order:
+1. `TERM_PROGRAM == "vscode"` ⇒ check Cursor env vars (`VSCODE_GIT_ASKPASS_*`, `VSCODE_IPC_HOOK_CLI`, `VSCODE_NLS_CONFIG` containing `"cursor"`) ⇒ `CURSOR`; else parse `TERM_PROGRAM_VERSION` for `-insider` suffix ⇒ `VSCODE_INSIDERS` or `VSCODE`.
+2. `TERM_PROGRAM` map: `iterm.app → ITERM2`, `wezterm → WEZTERM`, `ghostty → GHOSTTY`, `alacritty → ALACRITTY`, `kitty → KITTY`, `hyper → HYPER`.
+3. Env markers: `WEZTERM_PANE`, `GHOSTTY_RESOURCES_DIR`, `KITTY_WINDOW_ID`, `ALACRITTY_SOCKET`, `ALACRITTY_LOG`, `WT_SESSION → WINDOWS_TERMINAL`, `TERMINAL_EMULATOR` containing `"jetbrains" → JETBRAINS`.
+4. Else ⇒ `UNKNOWN`.
+
+### C.5 Clipboard (`vibe/cli/clipboard.py`)
+
+Copy strategies attempted in order until one verifies:
+1. **OSC 52** escape sequence (works over SSH, tmux-aware via `\033Ptmux;\033 … \033\\` wrapping).
+2. **pyperclip**.
+3. `pbcopy` (macOS), `xclip -selection clipboard` (X11), `wl-copy` (Wayland) — only if the binary is present.
+
+Paste: `pyperclip`, `pbpaste`, `xclip -o -selection clipboard`, `wl-paste`.
+
+`copy_selection_to_clipboard(app)` collects `text_selection` from focused widgets; toast "Copied to clipboard" or "Failed to copy - clipboard not available".
+
+### C.6 File indexer (`vibe/core/autocompletion/file_indexer/`)
+
+Default ignore patterns (`.gitignore`-style; `(pattern, is_exclude)` tuples) — used by `@`-autocomplete:
+
+```
+.git/, __pycache__/, node_modules/, .DS_Store, *.pyc, *.log, .vscode/, .idea/,
+/build/, dist/, target/, .next/, .nuxt/, coverage/, .nyc_output/, *.egg-info,
+.pytest_cache/, .tox/, vendor/, third_party/, deps/, *.min.js, *.min.css,
+*.bundle.js, *.chunk.js, .cache/, tmp/, temp/, logs/, .uv-cache/, .ruff_cache/,
+.venv/, venv/, .mypy_cache/, htmlcov/, .coverage
+```
+
+`WALK_SKIP_DIR_NAMES` is the frozenset of *directory-only, name-only, non-anchored* defaults — used by `walk_local_config_dirs` (project trust scan) AND by the indexer.
+
+`IndexEntry` carries `rel`, `rel_lower`, `name`, `path`, `is_dir`, and an `ascii_mask` bitset for fast ASCII pre-filtering.
+
+The indexer keeps a single-worker thread pool and tracks per-root rebuild tasks. The `watcher.py` (when enabled by config `file_watcher_for_autocomplete = true`) uses `watchfiles.watch()` to apply `Change.added | deleted | modified` events incrementally; ≥ 200 changes in one batch triggers a full rebuild.
+
+### C.7 Fuzzy matcher (`vibe/core/autocompletion/fuzzy.py`)
+
+Subsequence scoring with multipliers and bonuses:
+- Base score 100 + positional bonus/penalty.
+- ×2.0 prefix match, ×1.8 word-boundary match (`/`, `-`, `_`, `.`, uppercase transitions), ×1.3 consecutive match.
+- +2.0 per matching case, +10.0 per adjacent match, +5.0 per word boundary, +3.0 per uppercase boundary, ×1.5 per gap (penalty).
+- Empty pattern matches everything with score `0.0`. Returns `MatchResult(matched: bool, score: float, matched_indices: list[int])`.
+
+### C.8 ANSI markdown (`vibe/cli/textual_ui/ansi_markdown.py`)
+
+`AnsiMarkdown` extends Textual's `Markdown` to override `MarkdownFence.highlight()` with a custom `AnsiHighlightTheme` that maps Pygments tokens to Textual ANSI styles (e.g. `ansi_red`, `ansi_green`, `ansi_cyan`). Inline markdown (bold, italic, code) is rendered normally; fenced code blocks use Pygments with the ANSI theme.
+
+### C.9 Debug console (`vibe/cli/textual_ui/widgets/debug_console.py`)
+
+- Toggled with `Ctrl+\` (and `/debug`).
+- Displays `LogEntry` items from `LogReader`, level-coloured (`DEBUG=dim, INFO=cyan, WARNING=yellow, ERROR=red, CRITICAL=bold red`).
+- Initial page fills the viewport; scrolling up requests an earlier page from the file.
+- LRU render cache (1024 entries).
+
+### C.10 Themes
+
+No runtime theme switcher. Styling is via `vibe/cli/textual_ui/app.tcss`, with `$mistral_orange = #FF8205` as the brand accent. The Textual theme name is `"textual-ansi"` (hardcoded in `app.py`). Code-fence syntax highlighting uses the custom `AnsiHighlightTheme` (see C.8).
+
+### C.11 Modal apps / pickers
+
+| Modal | Triggered by | Purpose | Persistence |
+|-------|--------------|---------|-------------|
+| `ConfigApp` | `/config` | Toggle UX flags (autocopy, file watcher). Buttons open Model/Thinking pickers. | Saves changes via `VibeConfig.save_updates()` |
+| `ModelPickerApp` | `/model` or ConfigApp | OptionList of model aliases; current marked with `›` | Persists `active_model` in config |
+| `ThinkingPickerApp` | `/thinking` | OptionList of thinking levels | Persists `models[i].thinking` via `set_thinking()` |
+| `MCPApp` | `/mcp`, `/connectors`, banner | Hierarchical view of servers/connectors; per-tool enable/disable; OAuth prompts | Updates config + secrets |
+| `VoiceApp` | `/voice` | Toggle voice/narrator | Saves to config |
+| `SessionPickerApp` | `/resume` (no args) | OptionList of resumable sessions (time ago, source, id, latest message preview) | Read-only |
+| `ApprovalApp` | Tool needing approval | 4-option picker: *Yes (one-time), Always (this tool, this session), Always (permanent), No* | "Always permanent" persists into `tools.<name>.allowlist` config |
+| `ProxySetupApp` | `/proxy-setup` | Edit proxy env vars | Writes to `$VIBE_HOME/.env` |
+| `RewindApp` | `/rewind` or Alt+↑ | Highlight a prior user message; pick rewind variant | In-memory only |
+| `ConnectorAuthApp` | OAuth-required connector | Browser flow for connector auth | Saves token via secrets |
+
+### C.12 Scheduled loop runner (`vibe/cli/textual_ui/scheduled_loop_runner.py`, `vibe/core/loop.py`)
+
+- **Command syntax.** `/loop <interval> <prompt>` schedules; `/loop list` shows table; `/loop cancel <id|all>` cancels.
+- **Interval format.** `\d+[smhd]` (seconds/minutes/hours/days); minimum **30 seconds**.
+- **Persistence.** Loops are stored in `SessionMetadata.loops` (each: `id, interval_seconds, prompt, next_fire_at, created_at`) and serialised through `session_logger.persist_loops()`. `restore_from_session()` reloads them on resume.
+- **Polling.** Sleeps `max(0.05, min(time_until_next_due, 1.0))` seconds. On each tick: if `can_fire()` returns `True`, pop loops with `next_fire_at <= now`, fire each prompt as a new user message, append a `UserCommandMessage` to the chat, then update `next_fire_at`.
+
+### C.13 Recording UI (`vibe/cli/textual_ui/recording/recording_indicator.py`)
+
+- `RecordingIndicator` reads `VoiceManagerPort.transcribe_state` (IDLE / RECORDING / FLUSHING).
+- RECORDING: peak meter — polls `peak` every 50 ms, maps `[0,1]` to one of `▁▂▃▄▅▆▇█`.
+- FLUSHING: animation through `▏▎▍▌▋▊▉█` every 100 ms.
+- IDLE: hidden / empty.
+
+### C.14 Quit manager (`vibe/cli/textual_ui/quit_manager.py`)
+
+First Ctrl+C or Ctrl+D opens a 1.0 s confirmation window; `PathDisplay` shows `Press [key] again to quit`. Second matching keystroke within 1.0 s exits; mismatched / late keystroke resets.
+
+### C.15 Session exit (`vibe/cli/textual_ui/session_exit.py`)
+
+On graceful exit prints token usage summary (input / output / total) and the resume command (`vibe --continue` or `vibe --resume <id>`). `SessionLogger` has already flushed metadata.
+
+### C.16 External editor (`vibe/cli/textual_ui/external_editor.py`)
+
+`tempfile.mkstemp(suffix=".md", prefix="vibe_")` ⇒ write current input ⇒ `subprocess.run([editor_argv, file])` (blocking) ⇒ read back ⇒ unlink in `finally` ⇒ return None if unchanged or subprocess failed.
+
+### C.17 Windowing (`vibe/cli/textual_ui/windowing/`)
+
+Lazy-loads chat history on resume so resuming a 1000-message session doesn't render everything at once.
+- `SessionWindowing` tracks visible range and backfill state.
+- `HistoryResumePlan` carries `tail_messages`, `backfill_messages`, `tool_call_map`.
+- `create_resume_plan(history)` splits into tail (rendered immediately) and backfill (loaded on scroll-up).
+- `sync_backfill_state()` keeps it consistent when history mutates mid-session.
+
+### C.18 Notifications
+
+`NotificationContext.ACTION_REQUIRED` and `NotificationContext.COMPLETE`. Title is set with OSC 0 (`\x1b]0;{title}\x07`). Throttle: 1 notification / 1.0 s. Bell only fires while the app is unfocused; default title is restored on focus.
+
+### C.19 Remote (`vibe/cli/textual_ui/remote/`)
+
+`RemoteSessionManager` attaches to a Mistral-hosted (Vibe Code) session. Subscribes to a `RemoteEventsSource` that yields `AssistantEvent`, `ReasoningEvent`, `ToolCallEvent`, etc., and translates them to TUI updates. Handles `WaitingForInputEvent` (blocks the remote agent until the user responds via the question picker, up to 4 choices).
+
+### C.20 Banner (`vibe/cli/textual_ui/widgets/banner/`)
+
+ASCII art `petit chat` plus an info block:
+
+1. `Mistral Vibe v{version} · {model}[{thinking}] {plan_cta}`
+2. `{N} models · {N} connectors · {N} MCP servers · {N} skill[s]` (sections omitted when zero)
+3. `Type /help for more information`
+
+`PetitChat` animates on mount unless `disable_welcome_banner_animation = true`. `freeze_animation()` is called when the first user message arrives so the chat area becomes the focus.
+
+### C.21 Chat input (`vibe/cli/textual_ui/widgets/chat_input/text_area.py`)
+
+- Submit on Enter (without modifier).
+- Shift+Enter or Ctrl+J inserts a newline.
+- First non-whitespace character classifies the input mode: `>` chat, `!` shell command, `/` slash command, `&` reserved/experimental.
+- History up/down navigates `~/.vibe/vibehistory` (skips multi-line edits in progress).
+- Ctrl+G ⇒ external editor (see C.16).
+- Paste is detected via the `_cursor_moved_since_load` flag to allow correct multi-line pastes.
+
+### C.22 Update notifier UI
+
+A background async task (`_schedule_update_notification`) polls the configured gateway (PyPI / GitHub) at start and every check interval. When `UpdateAvailability.should_notify` is true, an inline notification is mounted with current/latest version and a hint to run the install/upgrade command.
+
+### C.23 What's New widget
+
+If `cache.seen_whats_new_version != current_version` AND `vibe/whats_new.md` is non-empty: load it, mount a `WhatsNewMessage(content)` widget styled with the `whats-new-message` class, and immediately call `mark_version_as_seen(current_version)` so it does not reappear next launch.
+
+---
+
+## Appendix D — Auxiliary Subsystems & Exact Wire / Text Content
+
+### D.1 Built-in prompt summaries (verbatim files in `vibe/core/prompts/`)
+
+| File | Length | Purpose | Notable directives |
+|------|--------|---------|--------------------|
+| `cli.md` | 110 lines | Default agent persona | "Most tasks need <150 words." Three-phase workflow (Orient/Plan/Execute). Explicit "Never say" / "Never use" word lists. Zero-emoji rule. |
+| `compact.md` | 49 lines | Compaction utility | Demands a 7-section summary: Goals, Timeline, Technical Context, Files & Code Changes, Active Work, Unresolved Issues, Immediate Next Step |
+| `turn_summary.md` | 11 lines | Turn-summary utility | 2–4 sentences covering: ask, actions, outcome, optional open questions |
+| `explore.md` | 51 lines | Explore subagent | "CODE/DIAGRAM FIRST." Bans greetings, announcements, hedging, puffery |
+| `lean.md` | 158 lines | Lean 4 specialist | Same Orient/Plan/Execute phases; Lean-specific commands (`lake exe cache get`, `lake build`, `grind` tactic, `trace_state` debug); long Hard Rules section |
+| `tests.md` | 1 line | Test fixture stub | `"You are Vibe, a super useful programming assistant."` |
+| `project_context.md` | 4 lines | Template injected into system prompt | Variables: `$abs_path`, `$git_status` |
+| `agents_doc.md` | 5 lines | AGENTS.md wrapper | Variable `$sections`. Declares precedence: project > user; closer-to-cwd > farther |
+| `dangerous_directory.md` | 5 lines | Project-context disable warning | Variables: `$reason`, `$abs_path` |
+
+### D.2 HarnessFilesManager (`vibe/core/config/harness_files/`)
+
+Singleton initialised by `init_harness_files_manager(*sources)`. `sources` is an ordered tuple, e.g. `("user", "project")`. The `"project"` source is suppressed when the working directory has not been (or cannot be) trusted.
+
+Per-source paths:
+- **user** — `~/.vibe/config.toml`, `~/.vibe/hooks.toml`, `~/.vibe/{tools,skills,agents,prompts}/`.
+- **project** — `<cwd>/.vibe/config.toml`, `<cwd>/.vibe/hooks.toml`, plus all `walk_local_config_dirs(cwd)` entries for `tools/`, `skills/`, `agents/`. Project AGENTS.md files are walked from cwd up to the trust root and concatenated outermost-first.
+
+Important properties:
+- `trusted_workdir` ⇒ `cwd` if `"project"` is enabled and the folder is trusted, else `None`.
+- `persist_allowed` ⇒ `True` iff `"user"` is in `sources` (controls whether `VibeConfig.save_updates()` actually writes).
+- `config_file` ⇒ project path if trusted-and-enabled, else user path.
+- `hook_files` ⇒ list of one or two hook TOML paths.
+
+### D.3 Browser sign-in (`vibe/setup/auth/`)
+
+Exact endpoints (relative to `provider.browser_auth_api_base_url`, default `https://console.mistral.ai/api`):
+
+1. `POST {api_base_url}/vibe/sign-in` — body `{code_challenge, code_challenge_method: "S256"}`. Response `CreateProcessPayload {process_id, sign_in_url, poll_url, expires_at}`.
+2. Open `sign_in_url` in the user's browser.
+3. `GET {poll_url}` repeatedly. Response `PollPayload {status: "pending"|"completed"|"expired"|"denied"|"error", exchange_token?, message?}`. Default poll interval 3.0 s; up to 3 consecutive failures tolerated; `410 Gone` ⇒ expired.
+4. `POST {api_base_url}/vibe/sign-in/{process_id}/exchange` — body `{exchange_token, code_verifier}`. Response `ExchangePayload {api_key}`.
+
+PKCE: SHA256-based code challenge.
+
+### D.4 Plan offer / WhoAmI (`vibe/cli/plan_offer/`)
+
+- Endpoint: `GET {provider.browser_auth_api_base_url}/vibe/whoami` (default base `https://console.mistral.ai/api`) — Vibe also computes a derived URL via `get_server_url_from_api_base()` when needed.
+- Header: `Authorization: Bearer {api_key}`.
+- Response: `{plan_type: str, plan_name: str, prompt_switching_to_pro_plan?: bool}`.
+
+`WhoAmIPlanType` enum: `API`, `CHAT`, `MISTRAL_CODE`, `UNKNOWN`, `UNAUTHORIZED`. `MistralCodePlanName`: `"F"` (free), `"E"` (enterprise).
+
+`PlanInfo` predicates:
+- `is_paid_api_plan()` — `API` and not free.
+- `is_free_api_plan()` — `API` with `"FREE"` in name.
+- `is_chat_pro_plan()` — `CHAT`.
+- `is_teleport_eligible()` — Chat Pro AND not `prompt_switching_to_pro_plan`.
+- `is_free_mistral_code_plan()` — `MISTRAL_CODE` with `plan_name == "F"`.
+- `is_mistral_code_enterprise_plan()` — `MISTRAL_CODE` with `plan_name == "E"`.
+
+`plan_offer_cta()` returns banner CTA markdown:
+- If `prompt_switching_to_pro_plan`: "Switch to your [Le Chat Pro API key](https://console.mistral.ai/codestral/cli)".
+- If `API` / `UNAUTHORIZED` / free Mistral Code: "Unlock more with Vibe — [Upgrade to Le Chat Pro](https://console.mistral.ai/codestral/cli)".
+
+### D.5 Lean install / uninstall
+
+`/leanstall` and `/unleanstall` mutate `installed_agents` in `config.toml` (adding/removing the `lean` entry) via `VibeConfig.save_updates()`. The mutation reloads the agent manager. **No external dependency installation is performed by Vibe** — the user is expected to have `lake`/`elan` available; the prompt embedded in `lean.md` instructs the agent how to bootstrap a Lean project. ACP also propagates the change through `set_config_option`.
+
+### D.6 MCP registry (`vibe/core/tools/mcp/registry.py`)
+
+- Each server's effective config is hashed (SHA256 of `model_dump_json`) into a fingerprint key.
+- `_cache: dict[fingerprint, dict[tool_name, proxy_class]]` survives agent switches; new tools are discovered only when the fingerprint changes.
+- HTTP / streamable-HTTP discovery: `list_tools_http(url, headers, startup_timeout_sec)`.
+- stdio discovery: `list_tools_stdio(cmd, env, cwd, startup_timeout_sec)`.
+- Each `RemoteTool` becomes a `MCPTool` proxy class via `create_mcp_http_proxy_tool_class()` or `create_mcp_stdio_proxy_tool_class()`.
+- Sampling: respects `sampling_enabled` per server. When the remote requests `sampling/createMessage`, the agent loop's active backend services it.
+
+### D.7 Connector registry (`vibe/core/tools/connectors/connector_registry.py`)
+
+- Bootstrap endpoint: `GET {server}/v1/connectors/bootstrap` with `Authorization: Bearer {MISTRAL_API_KEY}`.
+- Tools surfaced only when the connector entry has `status.is_ready == true`.
+- Per-connector `name` is normalised to `[a-zA-Z0-9_-]`, max 256 chars; collisions are deduped with a numeric suffix.
+- Tool name format: `connector_{alias}_{remote_name}`.
+- Tool execution endpoint: `POST {server}/v1/experimental/connectors/{connector_id}/mcp` (Mistral-side proxy that re-uses MCP semantics).
+
+### D.8 Vibe Code / Nuage workflow client (`vibe/core/nuage/client.py`)
+
+`WorkflowsClient` is an async HTTP client (`httpx.AsyncClient` with `build_ssl_context()`).
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `{base}/v1/workflows/{workflow_id}/execute` | POST | Start workflow with `WorkflowParams` |
+| `{base}/v1/workflows/events/stream` | GET (SSE) | Stream `StreamEvent`s |
+| `{base}/v1/workflows/executions/{execution_id}/signals` | POST | Send a workflow signal |
+| `{base}/v1/workflows/executions/{execution_id}/updates` | POST | Send a workflow update |
+| `{base}/v1/workflows/runs` | GET | List runs (pagination, status filter) |
+
+SSE parser ignores comment lines (`:…`) and blank lines, switches state on `event:` lines, and JSON-parses each `data:` block into `StreamEvent.model_validate(...)`. Errors yield `WorkflowsException`.
+
+### D.9 Teleport flow (`vibe/core/teleport/`)
+
+Ordered events (each a `BaseEvent` subclass):
+
+1. `TeleportCheckingGitEvent` — fetch remote, inspect status.
+2. `TeleportPushRequiredEvent(unpushed_count)` — surfaces if local is ahead. The user replies via `TeleportPushResponseEvent(approved: bool)`.
+3. `TeleportPushingEvent` — performs `git push`.
+4. `TeleportStartingWorkflowEvent` — calls `nuage_client.start_workflow()`.
+5. `TeleportWaitingForGitHubEvent` — polls until GitHub connection ready.
+6. `TeleportAuthRequiredEvent(oauth_url)` — when auth is needed; user signs in.
+7. `TeleportAuthCompleteEvent`.
+8. `TeleportFetchingUrlEvent`.
+9. `TeleportCompleteEvent(url)`.
+
+The git helpers cover `fetch()`, `is_commit_pushed()`, `is_branch_pushed()`, `get_unpushed_commit_count()`. Auth scope is whatever GitHub OAuth scope is configured upstream by the Nuage workflow; Vibe just opens the URL and polls.
+
+### D.10 Update notifier — `do_update`
+
+`vibe/cli/update_notifier/update.py::do_update()` tries, in order:
+1. `uv tool upgrade mistral-vibe`.
+2. `brew upgrade mistral-vibe`.
+
+Returns `True` on the first success. stdin is `DEVNULL`; stdout/stderr captured. **Only fired on user action** (no silent automatic upgrade) — the cache and notification just inform the user that an upgrade is available.
+
+### D.11 Data retention message (`vibe/core/data_retention.py`)
+
+Verbatim:
+
+```
+## Your Data Helps Improve Mistral AI
+
+At Mistral AI, we're committed to delivering the best possible experience. When you use Mistral models on our API, your interactions may be collected to improve our models, ensuring they stay cutting-edge, accurate, and helpful.
+
+Manage your data settings [here](https://admin.mistral.ai/plateforme/privacy)
+```
+
+### D.12 What's New (`vibe/cli/update_notifier/whats_new.py`, `vibe/whats_new.md`)
+
+`should_show_whats_new(current_version, repository)` — true iff `cache.seen_whats_new_version != current_version`. `load_whats_new_content()` reads `VIBE_ROOT/whats_new.md` (an empty marker file in the current release). On show, `mark_version_as_seen(current_version)` is called immediately.
+
+### D.13 Trustable file detection (`vibe/core/trusted_folders.py`)
+
+`find_trustable_files(path)` returns a list of relative names that, if present, would cause Vibe to read configuration: `AGENTS.md` and the relative paths of every directory returned by `walk_local_config_dirs(path).config_dirs`. The CLI calls this on startup; if non-empty AND the dir's trust state is `None`, it prompts via `ask_trust_folder()`.
+
+### D.14 Programmatic stdin handling (`vibe/cli/cli.py`)
+
+- `get_prompt_from_stdin()` reads all of stdin if not a TTY, then re-opens `/dev/tty` for future interactive use, strips whitespace, returns `None` if empty.
+- Precedence in programmatic mode: `--prompt VALUE` > stdin. If `-p` is given without value, stdin is required.
+- In interactive mode, stdin is used as the initial prompt when no positional argument is given.
+
+### D.15 Output formatter event handling
+
+- `TextOutputFormatter`: collects `LLMMessage`s; tracks `_final_response` from the last `AssistantEvent`; prints teleport status lines synchronously. `finalize()` prints `_final_response` (or the teleport URL on completion).
+- `JsonOutputFormatter`: collects messages; ignores events; `finalize()` prints `json.dumps(messages, indent=2)`.
+- `StreamingJsonOutputFormatter`: writes each `LLMMessage` as a single JSON line on `on_message_added`; ignores events; `finalize()` returns `None`.
+
+Only `LLMMessage` objects make it into `--output json|streaming`. Mid-stream events (`ToolCallEvent`, `CompactStartEvent`, …) influence the *text* surface only.
+
+### D.16 ACP exception code map (verbatim)
+
+```python
+UNAUTHENTICATED = -32000
+INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+METHOD_NOT_FOUND = -32601
+RATE_LIMITED = -31001
+CONFIGURATION_ERROR = -31002
+CONVERSATION_LIMIT = -31003
+CONTEXT_TOO_LONG = -31004
+```
+
+All raised as subclasses of `VibeRequestError(acp.RequestError)`: `UnauthenticatedError`, `NotImplementedMethodError`, `InvalidRequestError`, `SessionNotFoundError`, `SessionLoadError`, `RateLimitError`, `ContextTooLongError`, plus `ConversationLimitError`, `InternalError`.
+
+### D.17 Connector / MCP / Bash environment scrubbing
+
+The `bash` tool sets these env vars before running a subprocess:
+
+| Variable | Unix | Windows |
+|----------|------|---------|
+| `CI` | `true` | `true` |
+| `NONINTERACTIVE` | `1` | `1` |
+| `NO_TTY` | `1` | `1` |
+| `TERM` | `dumb` | (unchanged) |
+| `DEBIAN_FRONTEND` | `noninteractive` | — |
+| `GIT_PAGER` | `cat` | `more` |
+| `PAGER` | `cat` | `more` |
+| `LESS` | `-FX` | — |
+| `LC_ALL` | `en_US.UTF-8` | — |
+
+This guarantees deterministic, paginator-free output and avoids interactive prompts.
+
+---
+
+## Appendix E — Errata & Confirmations Against §1–§28
+
+This appendix amends or sharpens parts of the body where deeper inspection produced a more accurate statement.
+
+1. **Trusted-folders TOML format** (§7) — corrected inline. The file holds **TOML lists of strings under `trusted` and `untrusted` keys**, NOT tables of `path = ""` mappings.
+2. **`read_file` sensitive paths** (§11.1) — clarified: triggered by `**/.env` and `**/.env.*` glob patterns matched against the resolved path.
+3. **`task` default allowlist** (§11.6) — the only auto-approved subagent is `explore`; any other subagent (e.g. installed `lean` if used as a subagent) goes through `ASK`.
+4. **`websearch` model** (§11.11) — confirmed: `"mistral-vibe-cli-with-tools"`. Tool is hidden when no `MISTRAL_API_KEY`.
+5. **Auto-update** (§25) — corrected: there is no silent auto-upgrade; `do_update()` is only invoked on user action and tries `uv tool upgrade mistral-vibe`, then `brew upgrade mistral-vibe`.
+6. **Skill prompt injection** (§14) — `skill` tool wraps result in `<skill_content name="…">…</skill_content>` and `<skill_files>…</skill_files>` XML; up to 10 bundled non-`SKILL.md` files are listed by relative path.
+7. **`exit_plan_mode` UX** (§11.9) — clarified: it asks the user with three options — *Yes, auto-approve edits* ⇒ `accept-edits`; *Yes, require approval* ⇒ `default`; *No* ⇒ stay in `plan`.
+8. **`/loop` minimum interval** (§15) — minimum is **30 s**; format is `\d+[smhd]`.
+9. **Plan WhoAmI endpoint** (§16.7) — exact path is `/vibe/whoami` under the provider's `browser_auth_api_base_url` (default `https://console.mistral.ai/api`).
+10. **Browser sign-in endpoints** (§23.2) — exact endpoints are `/vibe/sign-in`, the polling URL returned by the server, and `/vibe/sign-in/{process_id}/exchange`. Default poll interval 3.0 s, max 3 consecutive failures tolerated, `HTTP 410` ⇒ expired.
+11. **Backend `count_tokens`** (§9.1) — the Mistral backend implements it by calling `complete(max_tokens=1)` and reading `usage.prompt_tokens`. It does **not** call a dedicated count-tokens endpoint.
+12. **Streaming tool-call assembly** (§9.5) — chunks of a single tool call are merged by `index`, with `function.arguments` string-concatenated; validation against the Pydantic args model is deferred until the message has fully accumulated. Invalid JSON falls back to `{}` silently before validation.
+13. **`bash` allowlist drift across versions** (§5.7 migration) — `find` was added to the default allowlist via migration; trailing ` *` patterns are stripped.
+
+---
+
+*End of specification — Appendices A–E complete the reproduction reference.*
+
